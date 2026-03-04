@@ -1,0 +1,240 @@
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    downloadContentFromMessage,
+    makeCacheableSignalKeyStore
+} = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const pino = require('pino');
+const readline = require('readline');
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+
+function normalizeNumber(value) {
+    return String(value || '').replace(/\D/g, '');
+}
+
+function toJid(number) {
+    const clean = normalizeNumber(number);
+    return clean ? `${clean}@s.whatsapp.net` : '';
+}
+
+function normalizeAnyJid(jidLike) {
+    const raw = String(jidLike || '');
+    if (!raw) return '';
+    const user = raw.split('@')[0].split(':')[0];
+    return user ? `${user}@s.whatsapp.net` : '';
+}
+
+function getMessageText(message) {
+    if (!message) return '';
+    if (message.conversation) return message.conversation;
+    if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
+    if (message.imageMessage?.caption) return message.imageMessage.caption;
+    if (message.videoMessage?.caption) return message.videoMessage.caption;
+    return '';
+}
+
+function getQuotedMessage(message) {
+    return (
+        message?.extendedTextMessage?.contextInfo?.quotedMessage ||
+        message?.imageMessage?.contextInfo?.quotedMessage ||
+        message?.videoMessage?.contextInfo?.quotedMessage ||
+        null
+    );
+}
+
+async function connectToWhatsApp() {
+    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    const { version } = await fetchLatestBaileysVersion();
+    let adminJid = normalizeAnyJid(state.creds?.me?.id);
+
+    const sock = makeWASocket({
+        version,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+        },
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+    });
+
+    const sendAdmin = async (payload) => {
+        const target = adminJid || normalizeAnyJid(sock.authState.creds?.me?.id);
+        if (!target) {
+            console.log('Admin JID ainda não definido.');
+            return;
+        }
+
+        try {
+            await sock.sendMessage(target, payload);
+        } catch (err) {
+            console.log('Falha ao enviar no PV do admin:', err?.message || err);
+        }
+    };
+
+    if (!sock.authState.creds.registered) {
+        console.log('Nenhuma sessão encontrada. Iniciando processo de pareamento...');
+        const phoneNumber = normalizeNumber(await question('Digite o seu número de WhatsApp (ex: 5511999999999): '));
+        adminJid = toJid(phoneNumber);
+
+        setTimeout(async () => {
+            try {
+                const code = await sock.requestPairingCode(phoneNumber);
+                console.log(`\nSeu código de pareamento é: \x1b[32m${code}\x1b[0m`);
+                console.log('Abra o WhatsApp > Aparelhos Conectados > Conectar com número de telefone e insira este código.\n');
+            } catch (err) {
+                console.error('Erro ao solicitar código de pareamento:', err);
+            }
+        }, 3000);
+    }
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Conexão fechada. Motivo:', lastDisconnect.error?.message);
+            sendAdmin({ text: `⚠️ Conexão fechada: ${lastDisconnect.error?.message || 'motivo desconhecido'}` });
+            if (shouldReconnect) {
+                console.log('Tentando reconectar...');
+                connectToWhatsApp();
+            } else {
+                console.log('Você foi desconectado. Apague a pasta "auth_info_baileys" e tente novamente.');
+                process.exit();
+            }
+        } else if (connection === 'open') {
+            adminJid = adminJid || normalizeAnyJid(sock.authState.creds?.me?.id);
+            console.log('\n=======================================');
+            console.log('BOT CONECTADO E SALVO COM SUCESSO!');
+            console.log('=======================================\n');
+            sendAdmin({ text: '✅ Bot conectado com sucesso.' });
+        }
+    });
+
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages?.[0];
+        if (!msg || !msg.message) return;
+
+        const from = normalizeAnyJid(msg.key.remoteJid);
+        const participant = normalizeAnyJid(msg.key.participant);
+        const adminTarget = adminJid || normalizeAnyJid(sock.authState.creds?.me?.id);
+        if (!adminTarget) return;
+        const sender = msg.key?.fromMe ? adminTarget : (participant || from);
+
+        if (sender !== adminTarget && from !== adminTarget) return;
+
+        const text = getMessageText(msg.message).trim();
+        if (!text) return;
+
+        const command = text.split(' ')[0].toLowerCase();
+
+        if (command === '.menu') {
+            const menuText = `
+╔══════════════════╗
+        🤖 LIMAX BOT MENU
+╚══════════════════╝
+
+📸 .
+📸 .ver
+📸 .explanar
+🧪 .teste
+`;
+            await sendAdmin({ text: menuText });
+            return;
+        }
+
+        if (command === '.teste') {
+            await sendAdmin({
+                text: '✅ | Bot online e conexão ativa.'
+            });
+            return;
+        }
+
+        if (command === '.' || command === '.ver' || command === '.explanar') {
+            const quotedMsg = getQuotedMessage(msg.message);
+
+            if (!quotedMsg) {
+                await sendAdmin({
+                    text: '❌ | Marque a mídia que você quer baixar e envie o comando novamente.'
+                });
+                return;
+            }
+
+            try {
+                let viewOnceMsg = quotedMsg.viewOnceMessageV2?.message || quotedMsg.viewOnceMessage?.message || quotedMsg;
+                let mediaType = Object.keys(viewOnceMsg || {})[0];
+
+                if (!mediaType) {
+                    await sendAdmin({
+                        text: '❌ | Não achei mídia nessa mensagem marcada.'
+                    });
+                    return;
+                }
+
+                if (mediaType === 'messageContextInfo') {
+                    mediaType = Object.keys(viewOnceMsg || {})[1];
+                }
+
+                let mediaContent = viewOnceMsg?.[mediaType];
+                let streamType;
+
+                if (mediaType === 'imageMessage') streamType = 'image';
+                else if (mediaType === 'videoMessage') streamType = 'video';
+                else if (mediaType === 'audioMessage') streamType = 'audio';
+                else {
+                    if (quotedMsg.imageMessage) {
+                        streamType = 'image';
+                        mediaContent = quotedMsg.imageMessage;
+                    } else if (quotedMsg.videoMessage) {
+                        streamType = 'video';
+                        mediaContent = quotedMsg.videoMessage;
+                    } else if (quotedMsg.audioMessage) {
+                        streamType = 'audio';
+                        mediaContent = quotedMsg.audioMessage;
+                    } else {
+                        await sendAdmin({
+                            text: '❌ | Não achei imagem, vídeo ou áudio nessa mensagem.'
+                        });
+                        return;
+                    }
+                }
+
+                const stream = await downloadContentFromMessage(mediaContent, streamType);
+                let buffer = Buffer.from([]);
+                for await (const chunk of stream) {
+                    buffer = Buffer.concat([buffer, chunk]);
+                }
+
+                if (streamType === 'image') {
+                    await sendAdmin({ image: buffer, caption: '✅ Mídia recebida.' });
+                } else if (streamType === 'video') {
+                    await sendAdmin({ video: buffer, caption: '✅ Mídia recebida.' });
+                } else if (streamType === 'audio') {
+                    await sendAdmin({
+                        audio: buffer,
+                        mimetype: 'audio/mpeg',
+                        ptt: true
+                    });
+                }
+            } catch (err) {
+                console.log('Erro ao baixar mídia:', err);
+                await sendAdmin({
+                    text: '❌ | Falha ao baixar mídia dessa mensagem.'
+                });
+            }
+        }
+    });
+}
+
+connectToWhatsApp().catch((err) => {
+    console.error('Erro ao iniciar bot:', err);
+    process.exit(1);
+});
+
