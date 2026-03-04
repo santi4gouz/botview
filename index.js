@@ -8,12 +8,20 @@ const {
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const pino = require('pino');
-const readline = require('readline');
 const { exec } = require('child_process');
 const fs = require('fs');
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+// ==================== DETECTAR AMBIENTE ====================
+const isRender = process.env.RENDER === 'true' || process.env.IS_RENDER === 'true';
+const BOT_NUMBER = process.env.BOT_NUMBER; // Pega da variável de ambiente
+
+// ==================== FUNÇÃO DE PERGUNTA APENAS PARA TERMUX ====================
+let question;
+if (!isRender) {
+    const readline = require('readline');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    question = (text) => new Promise((resolve) => rl.question(text, resolve));
+}
 
 // [RAFAX SYSTEM] MEMÓRIA RAM PARA O ANTI-DELETE
 const messageLog = new Map();
@@ -102,8 +110,22 @@ async function connectToWhatsApp() {
 
     if (!sock.authState.creds.registered) {
         console.log('Nenhuma sessão encontrada. Iniciando processo de pareamento...');
-        const phoneNumber = normalizeNumber(await question('Digite o seu número de WhatsApp (ex: 5511999999999): '));
-        adminJid = toJid(phoneNumber);
+        
+        let phoneNumber;
+        
+        // Se estiver no Render, usa a variável de ambiente
+        if (isRender && BOT_NUMBER) {
+            phoneNumber = normalizeNumber(BOT_NUMBER);
+            console.log(`Usando número da variável de ambiente: ${phoneNumber}`);
+            adminJid = toJid(phoneNumber);
+        } else if (!isRender && question) {
+            // Se estiver no Termux, pergunta interativamente
+            phoneNumber = normalizeNumber(await question('Digite o seu número de WhatsApp (ex: 5511999999999): '));
+            adminJid = toJid(phoneNumber);
+        } else {
+            console.error('Número não configurado para ambiente sem terminal!');
+            process.exit(1);
+        }
 
         setTimeout(async () => {
             try {
@@ -260,20 +282,20 @@ async function connectToWhatsApp() {
                     buffer = Buffer.concat([buffer, chunk]);
                 }
                 
-                // Salva imagem temporária
-                const inputPath = '/data/data/com.termux/files/home/temp_' + Date.now() + '.jpg';
-                const outputPath = '/data/data/com.termux/files/home/temp_' + Date.now() + '.webp';
+                // Salva imagem temporária - caminho adaptado para Render
+                const inputPath = '/tmp/temp_' + Date.now() + '.jpg';
+                const outputPath = '/tmp/temp_' + Date.now() + '.webp';
                 
                 fs.writeFileSync(inputPath, buffer);
                 
-                // Converte com ffmpeg (já vem instalado no Termux!)
+                // Converte com ffmpeg
                 exec(`ffmpeg -i ${inputPath} -vf "scale=512:512:force_original_aspect_ratio=increase,crop=512:512" -vcodec libwebp -lossless 0 -qscale 80 -loop 0 -an ${outputPath}`, async (error) => {
                     // Limpa imagem temporária
                     fs.unlinkSync(inputPath);
                     
                     if (error) {
                         console.log('Erro ffmpeg:', error);
-                        await sendAdmin({ text: '❌ | Erro na conversão. Verifique se o ffmpeg está instalado: pkg install ffmpeg' });
+                        await sendAdmin({ text: '❌ | Erro na conversão. Verifique se o ffmpeg está instalado.' });
                         return;
                     }
                     
